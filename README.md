@@ -1,4 +1,4 @@
-# Edge_AI_Fianl
+# Edge_AI_Fianl_36
 
 ## Abstract
 This repository contains a complete reproducible pipeline for:
