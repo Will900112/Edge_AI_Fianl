@@ -14,6 +14,7 @@ from hqq.core.quantize import BaseQuantizeConfig
 from hqq_utils import get_linear_tags_from_model, get_size_of_model, AutoHQQHFModel
 
 
+
 def get_quant_config_slm(model):
     quant_config = {}
     n_layers = model.config.num_hidden_layers
@@ -85,13 +86,13 @@ def evaluate_ppl(model, tokenizer, device="cuda:0"):
     return ppl.item()
 
 def main():
-     bk.enable_flash_sdp(False)
+    bk.enable_flash_sdp(False)
     bk.enable_mem_efficient_sdp(True)
     bk.enable_math_sdp(False)
     torch.manual_seed(0)
     random.seed(0)
     device = "cuda:0"
-
+    
     hf_repo = "will200112/quantized-llama3-3b"  
 
     merged = AutoModelForCausalLM.from_pretrained(
