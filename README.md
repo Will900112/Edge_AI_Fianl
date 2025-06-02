@@ -9,6 +9,21 @@ This repository contains a complete reproducible pipeline for:
 * Uploading  the merged model  to the Hugging Face Hub
 * Downloading the merged model, applying quantization locally, and benchmarking inference performance
 
+
+## The training and fine-tuning pipeline
+This project is structured into two main code parts and one utility module.
+
+**Custom Utilities**
+A custom module, `hqq_utils.py`, provides the necessary utilities to enable model quantization, patching, and device mapping using the HQQ framework.
+
+**Part 1: Training, DoRA integration, and uploading**
+In this part, we load the LLAMA3-3B (Instruct) model, apply 4-bit HQQ quantization, integrate DoRA adapters using PEFT, fine-tune the model on the WikiText-2 dataset, and finally merge the adapter weights back into the base model. We then upload both the merged model and the tokenizer to the Hugging Face Hub. You can implement it from `Training_Dora.py`
+
+**Part 2: Downloading, re-quantizing, and inference benchmarking**
+This section covers downloading the merged model from the Hugging Face Hub, applying local HQQ quantization with specified parameters, and running inference benchmarks, including throughput measurement and perplexity evaluation.You can implement it from `Inference.py`
+
+The following are the step-by-step processes of how we build and deploy the project.
+
 ## Requirements Set up
 Set up environment using the following:
 ***requirements.txt***
@@ -32,15 +47,7 @@ triton==3.2.0
 Install all requirements:
 `pip install -r requirements.txt`
 
-### Hugging Face Authentication
-
-Before uploading models, log in to Hugging Face CLI:
-```
-from huggingface_hub import login
-login(token="hf_YOUR_ACCESS_TOKEN")  # Replace with your token
-```
-### Custom Utilities and Function Setup
-The following includes a custom Python module, **hqq_utils.py**, which provides the necessary utilities to enable model quantization, patching, and device mapping using the HQQ framework.
+## Custom Utilities
 
 This file defines:
 * Model size calculation (get_size_of_model)
@@ -463,27 +470,32 @@ class AutoHQQHFModel(CustomHQQHFModel, CustomPatch):
 class AutoHQQTimmModel(CustomHQQTimmModel, CustomPatch):
     pass
 ```
-**Supporting Functions**
-In addition to the patching classes, we define several essential utility functions that control how the models are configured and benchmarked.
 
-These include:
-* A quantization configuration builder tailored to LLAMA3
-* A token generation loop using past key values
-* A perplexity evaluation function against the WikiText-2 dataset
 
+## Part 1: Training, DoRA integration, and uploading
+We will begin training our model. First, we need to import the following tools.
 ```
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from tqdm.auto import tqdm
-from datasets import load_dataset
 import random
 import numpy as np
-from hqq.utils.patching import prepare_for_inference
-from hqq_utils import AutoHQQHFModel
-from hqq.core.quantize import BaseQuantizeConfig
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from datasets import load_dataset
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+from huggingface_hub import login
+from hqq.core.quantize import HQQLinear, HQQBackend, BaseQuantizeConfig
+from hqq_utils import AutoHQQHFModel, get_size_of_model
+```
+### Supporting Functions
+In addition to the patching classes, we define several essential utility functions.
 
+These include:
+* A quantization configuration builder tailored to LLAMA3
+* A tokenization function to process dataset examples
+* A function to group tokenized texts into fixed-length blocks for training
 
+```
 def get_quant_config_slm(model):
     quant_config = {}
     n_layers = model.config.num_hidden_layers
@@ -500,8 +512,166 @@ def get_quant_config_slm(model):
 
     return quant_config
 
+def tokenize_fn(examples):
+        return tokenizer(examples["text"])
+
+def group_texts(examples):
+    block_size = 512
+    concat = {k: sum(examples[k], []) for k in examples.keys()}
+    total_len = (len(concat["input_ids"]) // block_size) * block_size
+    result = {k: [t[i:i + block_size] for i in range(0, total_len, block_size)] for k, t in concat.items()}
+    result["labels"] = result["input_ids"].copy()
+    return result
+
+```
+### Step 1: Load and Quantize Base Model
 
 
+We load LLAMA3-3B (Instruct) and apply 4-bit HQQ quantization.
+```
+login(token="hf_YOUR_ACCESS_TOKEN")  # Replace with your token
+
+torch.manual_seed(0)
+random.seed(0)
+device = 'cuda:0'
+
+model_name = "meta-llama/Llama-3.2-3B-Instruct"
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.bfloat16,
+    device_map=device,
+).eval()
+
+HQQLinear.set_backend(HQQBackend.PYTORCH)
+print(f"Model size before quantization: {get_size_of_model(model) / (1024**2):.2f} MiB")
+
+quant_config = get_quant_config_slm(model)
+AutoHQQHFModel.quantize_model(model, quant_config=quant_config, compute_dtype=torch.bfloat16, device=device)
+print(f"Model size after quantization: {get_size_of_model(model) / (1024**2):.2f} MiB")
+
+```
+
+
+### Step 2: Integrate  DoRA Adapters
+```
+lora_cfg = LoraConfig(
+    r=4,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    bias="none",
+    target_modules=["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"],
+    task_type=TaskType.CAUSAL_LM,
+    use_dora=True
+)
+for p in model.parameters():
+    p.requires_grad = False
+model = get_peft_model(model, lora_cfg)
+model.to(torch.bfloat16)
+model.print_trainable_parameters()
+```
+
+### Step 3: Fine-Tune on WikiText-2
+
+```
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+    model.config.pad_token_id = tokenizer.eos_token_id
+
+dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+
+
+tokenized = dataset.map(tokenize_fn, batched=True, num_proc=4, remove_columns=["text"])
+
+
+lm_dataset = tokenized.map(group_texts, batched=True, batch_size=1000, num_proc=4)
+
+training_args = TrainingArguments(
+    output_dir="./adapter_ckpt",
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=8,
+    learning_rate=3e-4,
+    num_train_epochs=2,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.05,
+    bf16=True,
+    max_grad_norm=0.3,
+    optim="paged_adamw_8bit",
+    logging_steps=50,
+    save_steps=200,
+    save_total_limit=2,
+    report_to="none"
+)
+
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, pad_to_multiple_of=8)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=lm_dataset["train"],
+    eval_dataset=lm_dataset["validation"],
+    data_collator=data_collator
+)
+
+trainer.train()
+model.save_pretrained("./my_adapter")
+tokenizer.save_pretrained("./my_adapter")
+```
+
+### Step 4: Merging adapter with the base model and upload to Hugging Face Hub
+```
+base = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map=device, attn_implementation="sdpa").eval()
+lora_model = PeftModel.from_pretrained(base, "./my_adapter").eval()
+merged = lora_model.merge_and_unload().eval()
+
+hf_repo = "will200112/quantized-llama3-3b"
+merged.push_to_hub(hf_repo, safe_serialization=True)
+tokenizer.push_to_hub(hf_repo)
+
+print(f"Model and tokenizer uploaded to https://huggingface.co/{hf_repo}")
+
+```
+
+## Part 2: Downloading, re-quantizing, and inference benchmarking
+We will begin downloading, re-quantizing our model. First, we need to import the following tools.
+```
+import os
+import csv
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.backends.cuda as bk
+from tqdm import tqdm, auto
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
+from peft import PeftModel
+from hqq.utils.patching import prepare_for_inference
+from hqq.core.quantize import BaseQuantizeConfig
+from hqq_utils import get_linear_tags_from_model, get_size_of_model, AutoHQQHFModel
+```
+### Supporting Functions
+We define several essential functions.
+These include:
+* A quantization configuration builder tailored to LLAMA3
+* A token generation loop using past key values
+* A perplexity evaluation function against the WikiText-2 dataset
+```
+def get_quant_config_slm(model):
+    quant_config = {}
+    n_layers = model.config.num_hidden_layers
+    q4_config = BaseQuantizeConfig(nbits=4, group_size=1024)
+
+    for i in range(n_layers):
+        quant_config[f'model.layers.{i}.self_attn.q_proj'] = q4_config
+        quant_config[f'model.layers.{i}.self_attn.k_proj'] = q4_config
+        quant_config[f'model.layers.{i}.self_attn.v_proj'] = q4_config
+        quant_config[f'model.layers.{i}.self_attn.o_proj'] = q4_config
+        quant_config[f'model.layers.{i}.mlp.gate_proj'] = q4_config
+        quant_config[f'model.layers.{i}.mlp.up_proj'] = q4_config
+        quant_config[f'model.layers.{i}.mlp.down_proj'] = q4_config
+
+    return quant_config
 def generate(model, input_ids, past_key_values, max_new_tokens):
     input_ids = input_ids.clone()
     with torch.no_grad():
@@ -556,181 +726,19 @@ def evaluate_ppl(model, tokenizer, device="cuda:0"):
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
     return ppl.item()
 
-```
-
-
-## Step 1: Load and Quantize Base Model
-
-We load LLAMA3-3B (Instruct) and apply 4-bit HQQ quantization.
-```
-from transformers import AutoModelForCausalLM
-from hqq.core.quantize import HQQLinear, HQQBackend
-from hqq_utils import AutoHQQHFModel, get_size_of_model, get_quant_config_slm
-import torch, random
-
-torch.manual_seed(0)
-random.seed(0)
-device = 'cuda:0'
-
-model_name = "meta-llama/Llama-3.2-3B-Instruct"
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.bfloat16,
-    device_map=device,
-)
-model.eval()
-
-HQQLinear.set_backend(HQQBackend.PYTORCH)
-
-print(f"Model size before quantization: {get_size_of_model(model) / (1024**2):.2f} MiB")
-
-quant_config = get_quant_config_slm(model)
-AutoHQQHFModel.quantize_model(
-    model,
-    quant_config=quant_config,
-    compute_dtype=torch.bfloat16,
-    device=device,
-)
-
-print(f"Model size after quantization: {get_size_of_model(model) / (1024**2):.2f} MiB")
-```
-
-
-## Step 2: Integrate  DoRA Adapters
-```
-from peft import LoraConfig, get_peft_model, TaskType
-
-lora_cfg = LoraConfig(
-    r=4,
-    lora_alpha=16,
-    lora_dropout=0.05,
-    bias="none",
-    target_modules=["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"],
-    task_type=TaskType.CAUSAL_LM,
-    use_dora=True
-)
-
-for p in model.parameters():
-    p.requires_grad = False
-
-model = get_peft_model(model, lora_cfg)
-model.to(torch.bfloat16)
-model.print_trainable_parameters()
-```
-
-## Step 3: Fine-Tune on WikiText-2
 
 ```
-from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
-from datasets import load_dataset
+### Step 1: Download the model we uploaded before from Hugging Face
 
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-    model.config.pad_token_id = tokenizer.eos_token_id
-
-dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
-
-def tokenize_fn(examples):
-    return tokenizer(examples["text"])
-
-tokenized = dataset.map(tokenize_fn, batched=True, num_proc=4, remove_columns=["text"])
-
-def group_texts(examples):
-    block_size = 512
-    concat = {k: sum(examples[k], []) for k in examples.keys()}
-    total_len = (len(concat["input_ids"]) // block_size) * block_size
-    result = {
-        k: [t[i:i + block_size] for i in range(0, total_len, block_size)]
-        for k, t in concat.items()
-    }
-    result["labels"] = result["input_ids"].copy()
-    return result
-
-lm_dataset = tokenized.map(group_texts, batched=True, batch_size=1000, num_proc=4)
-
-training_args = TrainingArguments(
-    output_dir="./adapter_ckpt",
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=8,
-    learning_rate=3e-4,
-    num_train_epochs=2,
-    lr_scheduler_type="cosine",
-    warmup_ratio=0.05,
-    bf16=True,
-    max_grad_norm=0.3,
-    optim="paged_adamw_8bit",
-    logging_steps=50,
-    save_steps=200,
-    save_total_limit=2,
-    report_to="none"
-)
-
-data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, pad_to_multiple_of=8)
-
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=lm_dataset["train"],
-    eval_dataset=lm_dataset["validation"],
-    data_collator=data_collator
-)
-
-trainer.train()
-model.save_pretrained("./my_adapter")
-tokenizer.save_pretrained("./my_adapter")
 ```
-
-## Step 4: Merging adapter with the base model and upload to Hugging Face Hub
-```
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel
-import torch, random
-
+bk.enable_flash_sdp(False)
+bk.enable_mem_efficient_sdp(True)
+bk.enable_math_sdp(False)
 torch.manual_seed(0)
 random.seed(0)
 device = "cuda:0"
 
-model_name = "meta-llama/Llama-3.2-3B-Instruct"
-adapter_path = "./my_adapter"
-hf_repo = "will200112/quantized-llama3-3b"  # Replace with your Hugging Face repo
-
-# Load base model
-base = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float16,
-    device_map=device,
-    attn_implementation="sdpa"
-).eval()
-
-# Load DoRA adapter and merge
-lora_model = PeftModel.from_pretrained(base, adapter_path).eval()
-merged = lora_model.merge_and_unload()
-merged.eval()
-
-# Upload merged model
-merged.push_to_hub(hf_repo, safe_serialization=True)
-
-# Upload tokenizer
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-tokenizer.push_to_hub(hf_repo)
-
-print(f"Model and tokenizer uploaded to https://huggingface.co/{hf_repo}")
-
-```
-
-## Step 5: Download, Re-Quantize, Then Inference
-In this step:
-* Download the model we uploaded before from Hugging Face
-```
-import torch, random
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-torch.manual_seed(0)
-random.seed(0)
-device = "cuda:0"
-
-hf_repo = "will200112/quantized-llama3-3b"
+hf_repo = "will200112/quantized-llama3-3b"  
 
 merged = AutoModelForCausalLM.from_pretrained(
     hf_repo,
@@ -738,37 +746,9 @@ merged = AutoModelForCausalLM.from_pretrained(
     device_map=device,
     attn_implementation="sdpa"
 ).eval()
-
-tokenizer = AutoTokenizer.from_pretrained(hf_repo)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-    merged.config.pad_token_id = tokenizer.eos_token_id
 ```
-* Quantize the merged model with 4-bit & group size= 1024
-```
-def get_quant_config_slm(model):
-    quant_config = {}
-    n_layers = model.config.num_hidden_layers
-    q4_config = BaseQuantizeConfig(nbits=4, group_size=1024)
-
-    for i in range(n_layers):
-        quant_config[f'model.layers.{i}.self_attn.q_proj'] = q4_config
-        quant_config[f'model.layers.{i}.self_attn.k_proj'] = q4_config
-        quant_config[f'model.layers.{i}.self_attn.v_proj'] = q4_config
-        quant_config[f'model.layers.{i}.self_attn.o_proj'] = q4_config
-        quant_config[f'model.layers.{i}.mlp.gate_proj'] = q4_config
-        quant_config[f'model.layers.{i}.mlp.up_proj'] = q4_config
-        quant_config[f'model.layers.{i}.mlp.down_proj'] = q4_config
-
-    return quant_config
-```
-
-* Quantize the merged model locally using HQQ
-```
-from hqq_utils import get_size_of_model, AutoHQQHFModel, get_quant_config_slm
-from hqq.utils.patching import prepare_for_inference
-import torch
-
+### Step 2: Quantize the merged model with 4-bit & group size= 1024
+``` 
 quant_cfg = get_quant_config_slm(merged)
 AutoHQQHFModel.quantize_model(
     merged,
@@ -778,31 +758,29 @@ AutoHQQHFModel.quantize_model(
 )
 
 print(f"Model size after quantization: {get_size_of_model(merged)/(1024**2):.2f} MiB")
+```
+### Step 3: Run the inference benchmarking and perplexity evaluation
+```
+tokenizer = AutoTokenizer.from_pretrained(hf_repo)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+    merged.config.pad_token_id = tokenizer.eos_token_id
 
-prepare_for_inference(merged.model, backend="gemlite")
+model = merged
+prepare_for_inference(model.model, backend="gemlite")
 
-merged.forward = torch.compile(
-    merged.forward,
+model.forward = torch.compile(
+    model.forward,
     mode="max-autotune",
     fullgraph=False,
     dynamic=True,
 )
-merged.prefill_forward = merged.forward
+model.prefill_forward = model.forward
 
-
-```
-* Run the inference benchmarking and perplexity evaluation
-```
-import csv, numpy as np
-from tqdm import tqdm
-from transformers import StaticCache
-from hqq_utils import generate, evaluate_ppl
-import torch
-
-cache_device = next(merged.parameters()).device
+cache_device = next(model.parameters()).device
 max_new_tokens = 256
 past_key_values = StaticCache(
-    config=merged.config,
+    config=model.config,
     max_batch_size=1,
     max_cache_len=max_new_tokens + 16,
     device=cache_device,
@@ -813,7 +791,7 @@ warmup_prompt = "Explain what AI is."
 inputs = tokenizer(warmup_prompt, return_tensors="pt").to(device)
 input_ids = inputs["input_ids"]
 for _ in tqdm(range(5), desc="Warm Up..."):
-    _ = generate(merged, input_ids, past_key_values, max_new_tokens)
+    _ = generate(model, input_ids, past_key_values, max_new_tokens)
     past_key_values.reset()
 
 prompt = "How to learn a new language?"
@@ -827,7 +805,7 @@ for _ in tqdm(range(10), desc="Test Inference"):
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    generated = generate(merged, input_ids, past_key_values, max_new_tokens)
+    generated = generate(model, input_ids, past_key_values, max_new_tokens)
     past_key_values.reset()
     end.record()
     torch.cuda.synchronize()
@@ -845,7 +823,7 @@ print(f'Time Record: {time_record}')
 print(f'Throughput Record: {tputs} toks/s\n')
 print(f'Throughput: {org_tput} toks/s')
 
-ppl = evaluate_ppl(merged, tokenizer, device)
+ppl = evaluate_ppl(model, tokenizer, device)
 print(f"Perplexity (PPL): {ppl}")
 
 with open("result.csv", mode="w", newline="") as file:
