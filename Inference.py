@@ -1,10 +1,18 @@
-import torch, random, os, csv, numpy as np
-from tqdm import tqdm
+import os
+import csv
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.backends.cuda as bk
+from tqdm import tqdm, auto
+from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
 from peft import PeftModel
 from hqq.utils.patching import prepare_for_inference
+from hqq.core.quantize import BaseQuantizeConfig
 from hqq_utils import get_linear_tags_from_model, get_size_of_model, AutoHQQHFModel
-import torch.backends.cuda as bk
+
 
 def get_quant_config_slm(model):
     quant_config = {}
@@ -77,26 +85,21 @@ def evaluate_ppl(model, tokenizer, device="cuda:0"):
     return ppl.item()
 
 def main():
-    bk.enable_flash_sdp(False)
+     bk.enable_flash_sdp(False)
     bk.enable_mem_efficient_sdp(True)
     bk.enable_math_sdp(False)
     torch.manual_seed(0)
     random.seed(0)
     device = "cuda:0"
 
-    model_name = "meta-llama/Llama-3.2-3B-Instruct"
-    adapter_path = "/content"
+    hf_repo = "will200112/quantized-llama3-3b"  
 
-    base = AutoModelForCausalLM.from_pretrained(
-        model_name,
+    merged = AutoModelForCausalLM.from_pretrained(
+        hf_repo,
         torch_dtype=torch.float16,
         device_map=device,
         attn_implementation="sdpa"
     ).eval()
-
-    lora_model = PeftModel.from_pretrained(base, adapter_path).eval()
-    merged = lora_model.merge_and_unload()
-    merged.eval()
 
     quant_cfg = get_quant_config_slm(merged)
     AutoHQQHFModel.quantize_model(
@@ -108,7 +111,7 @@ def main():
 
     print(f"Model size after quantization: {get_size_of_model(merged)/(1024**2):.2f} MiB")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(hf_repo)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         merged.config.pad_token_id = tokenizer.eos_token_id
