@@ -14,12 +14,15 @@ This repository contains a complete reproducible pipeline for:
 This project is structured into two main code parts and one utility module.
 
 **Custom Utilities**
+
 A custom module, `hqq_utils.py`, provides the necessary utilities to enable model quantization, patching, and device mapping using the HQQ framework.
 
 **Part 1: Training, DoRA integration, and uploading**
+
 In this part, we load the LLAMA3-3B (Instruct) model, apply 4-bit HQQ quantization, integrate DoRA adapters using PEFT, fine-tune the model on the WikiText-2 dataset, and finally merge the adapter weights back into the base model. We then upload both the merged model and the tokenizer to the Hugging Face Hub. You can implement it from `Training_Dora.py`
 
 **Part 2: Downloading, re-quantizing, and inference benchmarking**
+
 This section covers downloading the merged model from the Hugging Face Hub, applying local HQQ quantization with specified parameters, and running inference benchmarks, including throughput measurement and perplexity evaluation.You can implement it from `Inference.py`
 
 The following are the step-by-step processes of how we build and deploy the project.
