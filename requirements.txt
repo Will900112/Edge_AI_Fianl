@@ -1,0 +1,14 @@
+torch
+torchvision
+torchaudio
+transformers
+huggingface-hub[cli]
+datasets==3.5.0
+timm==1.0.15
+accelerate==1.6.0
+bitsandbytes>=0.43.0
+peft
+tqdm
+gemlite==0.4.4
+hqq==0.2.5
+triton==3.2.0
